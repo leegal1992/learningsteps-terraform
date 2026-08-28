@@ -2,7 +2,7 @@
 
 A one-command Azure deployment of the [LearningSteps](https://github.com/CyberstepsDE/learningsteps) API and a PostgreSQL database.
 
-For the 5-day walkthrough built on top of this deployment, see [handbook.md](handbook.md).
+For the walkthrough built on top of this deployment, see [handbook.md](handbook.md).
 
 > **This deployment is intentionally minimal and unsecured.** The VM is publicly reachable, the database accepts connections from any IP, credentials are stored in plaintext, and there is no traffic inspection or monitoring. It is a starting point — not a production setup.
 
