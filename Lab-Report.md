@@ -1,8 +1,11 @@
 # LearningSteps Lockdown - Lab Report (Days 1 & 2)
 
 **Student:** Lee Gal
+
 **Date:** 01.09.26
+
 **Module:** Module 3. Cloud
+
 **Exercise:** LearningSteps Lockdown - Day 1 (Locking Down Management Access) & Day 2 (Encryption and a Web Application Firewall)
 
 ---
