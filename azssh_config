@@ -17,3 +17,12 @@ Host 52.233.241.89
 	User lee.gal@cybersteps.onmicrosoft.com
 	CertificateFile "C:\Users\leega\Desktop\cyber\LearningSteps\learningsteps-terraform\az_ssh_config\rg-lee-vm-lee\id_rsa.pub-aadcert.pub"
 	IdentityFile "C:\Users\leega\Desktop\cyber\LearningSteps\learningsteps-terraform\az_ssh_config\rg-lee-vm-lee\id_rsa"
+Host rg-lee-vm-lee
+	User lee.gal@cybersteps.onmicrosoft.com
+	HostName 52.233.241.89
+	CertificateFile "C:\Users\leega\Desktop\cyber\LearningSteps\learningsteps-terraform\az_ssh_config\rg-lee-vm-lee\id_rsa.pub-aadcert.pub"
+	IdentityFile "C:\Users\leega\Desktop\cyber\LearningSteps\learningsteps-terraform\az_ssh_config\rg-lee-vm-lee\id_rsa"
+Host 52.233.241.89
+	User lee.gal@cybersteps.onmicrosoft.com
+	CertificateFile "C:\Users\leega\Desktop\cyber\LearningSteps\learningsteps-terraform\az_ssh_config\rg-lee-vm-lee\id_rsa.pub-aadcert.pub"
+	IdentityFile "C:\Users\leega\Desktop\cyber\LearningSteps\learningsteps-terraform\az_ssh_config\rg-lee-vm-lee\id_rsa"

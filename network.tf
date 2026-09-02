@@ -33,7 +33,7 @@ resource "azurerm_network_security_group" "app" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "22"
-    source_address_prefix      = "79.196.253.208/32"
+    source_address_prefix      = "79.196.253.182/32"
     destination_address_prefix = "*"
   }
 

@@ -1,0 +1,7 @@
+﻿{
+    "web":  {
+                "redirectUris":  [
+                                     "https://lee.westeurope.cloudapp.azure.com/oauth2/callback"
+                                 ]
+            }
+}
