@@ -17,6 +17,12 @@ This exercise hardened the LearningSteps environment (a FastAPI application back
 
 The key result was not just completing the prescribed steps, but discovering two real, unplanned security findings along the way. First, a WAF bypass: a SQL injection payload using '+' to encode spaces (id=1+UNION+SELECT...) passed through the WAF undetected in real time, while the logically identical payload using proper percent-encoding (%20) was correctly blocked - demonstrating that signature-based WAFs are encoding-sensitive and do not guarantee protection against all representations of the same attack. Second, unsolicited internet-scanning traffic was observed hitting the VM from an unrelated IP address (Contabo GmbH, France) within hours of the environment becoming public, using a spoofed, over a decade old browser User-Agent string - direct evidence that any publicly reachable service is found and probed by automated actors almost immediately, independent of anything the operator does.
 
+Day 3 (Identity-Based API Access)
+
+Day 3 deployed oauth2-proxy behind NPMplus to require a valid Entra ID token before any request reaches the app, replacing anonymous access entirely.
+Nearly every step surfaced a real bug rather than a scripted one: a misleading "insufficient privileges" error was actually a tenant display-name collision; a successful Microsoft login still failed with a 500 due to a missing email claim on the classroom account; and saving one NPMplus setting failed because the WAF was blocking its own admin traffic. The key confirming result: the same SQLi payload now returns 302 (redirect to login) when unauthenticated but 403 when sent from a logged-in session — proof identity and the WAF are complementary layers, not redundant ones.
+
+
 ---
 # **2. Tools & Environment**
 
