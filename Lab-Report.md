@@ -1,4 +1,4 @@
-# LearningSteps Lockdown - Lab Report (Days 1 & 2)
+# LearningSteps Lockdown
 
 **Student Name:** Lee Gal
 
@@ -220,6 +220,249 @@ sudo docker exec crowdsec cscli console status
 Checking whether community threat-intel sharing is active, and making a deliberate decision on whether to keep it enabled for this environment.
 
 ---
+### Day 3 - Identity-Based API Access
+
+**Goal:** require a valid Entra ID identity token before any request reaches the application, replacing anonymous access to the API, and confirm that identity enforcement and the WAF are complementary rather than redundant.
+
+#### Step 1: Register an Entra ID Application
+
+The first attempt to register an application failed with `ERROR: Insufficient privileges to complete the operation`:
+
+```powershell
+$APP_ID = az ad app create --display-name learningsteps-oauth2-proxy `
+    --sign-in-audience AzureADMyOrg `
+    --query appId -o tsv
+```
+
+![Insufficient privileges error](./screenshots/28-app-registration-INSUFFICIENT-PRIVILEGES.png)
+
+*Initial app registration attempt fails with an "Insufficient privileges" error.*
+
+Root cause investigation showed this was **not** a missing Entra ID role, but a **display-name collision** in a shared classroom tenant: `az ad app create` found an existing application with the same display name and attempted to patch it instead of creating a new one. Ownership checks on both existing `learningsteps-oauth2-proxy` apps confirmed neither belonged to this account - one was orphaned (no owner at all), the other belonged to a classmate:
+
+```powershell
+az ad app list --display-name learningsteps-oauth2-proxy --query "[].{DisplayName:displayName, AppId:appId, ObjectId:id}" -o table
+az ad app owner list --id <ObjectId> --query "[].userPrincipalName" -o tsv
+```
+
+![Ownership check root cause](./screenshots/28b-ownership-check-root-cause.png)
+
+![Ownership check root cause continued](./screenshots/28c-ownership-check-root-cause.png)
+
+*Listing all apps with the colliding display name and checking ownership confirms neither existing app belongs to this account - the true root cause of the "insufficient privileges" error.*
+
+The fix was to use a unique display name, which registered cleanly:
+
+```powershell
+$APP_ID = az ad app create --display-name learningsteps-oauth2-proxy-lee `
+    --sign-in-audience AzureADMyOrg `
+    --query appId -o tsv
+az ad app update --id $APP_ID --identifier-uris "api://$APP_ID"
+az ad sp create --id $APP_ID
+$SECRET = az ad app credential reset --id $APP_ID --query password -o tsv
+$TENANT_ID = az account show --query tenantId -o tsv
+```
+
+![App registration created](./screenshots/28d-app-registration-created.png)
+
+*Service Principal successfully created under a unique display name, avoiding the tenant-wide naming collision.*
+
+![Confirm IDs](./screenshots/28e-confirm-id.png)
+
+*Confirming $APP_ID, $TENANT_ID, and $SECRET all resolved to real, non-empty values before proceeding.*
+
+Two required follow-up configuration steps - forcing v2.0-format access tokens, and exposing an API scope with a registered reply URL - both initially failed with `Bad Request` errors from Microsoft Graph due to a missing `Content-Type` header, which `az rest` does not always set automatically on Windows/PowerShell:
+
+```powershell
+az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJECT_ID" `
+  --headers "Content-Type=application/json" `
+  --body '{"api":{"requestedAccessTokenVersion":2}}'
+```
+
+![Token version set to v2](./screenshots/29-token-version-v2-set.png)
+
+*Forcing v2.0-format access tokens, once the Content-Type header was explicitly specified.*
+
+The reply URL PATCH additionally failed even with the header fix, due to a payload-parsing issue specific to `az ad app update`'s inline JSON handling on Windows; writing the JSON body to a file and referencing it with `@filename` resolved it:
+
+```powershell
+$redirectBody | Out-File -FilePath redirect.json -Encoding utf8 -NoNewline
+az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJECT_ID" `
+  --headers "Content-Type=application/json" `
+  --body "@redirect.json"
+```
+
+![Scope PATCH](./screenshots/30a-scope-patch.png)
+
+*Exposing the oauth2PermissionScopes API scope required for token requests.*
+
+![Redirect URI PATCH](./screenshots/30b-redirect-uri-patch.png)
+
+*Registering the HTTPS reply URL after working around the inline-JSON parsing issue via a file-based request body.*
+
+#### Step 2: Configure and Start oauth2-proxy
+
+oauth2-proxy was confirmed pre-installed but idle before configuration:
+
+```bash
+systemctl is-active oauth2-proxy
+```
+
+![oauth2-proxy inactive before configuration](./screenshots/31-oauth2proxy-inactive-before.png)
+
+*oauth2-proxy service present but correctly inactive prior to receiving real credentials.*
+
+Real credentials from Step 1 were inserted into the service's environment file, and the redirect URL was set:
+
+```bash
+sudo sed -i \
+  -e "s#^OAUTH2_PROXY_CLIENT_ID=.*#OAUTH2_PROXY_CLIENT_ID=<app-id>#" \
+  -e "s#^OAUTH2_PROXY_CLIENT_SECRET=.*#OAUTH2_PROXY_CLIENT_SECRET=<client-secret>#" \
+  -e "s#^OAUTH2_PROXY_OIDC_ISSUER_URL=.*#OAUTH2_PROXY_OIDC_ISSUER_URL=https://login.microsoftonline.com/<tenant-id>/v2.0#" \
+  -e "s#^OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=.*#OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=api://<app-id>#" \
+  /etc/oauth2-proxy/oauth2-proxy.env
+
+sudo sed -i "s#REPLACE_WITH_DOMAIN#lee.westeurope.cloudapp.azure.com#" /etc/systemd/system/oauth2-proxy.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now oauth2-proxy
+```
+
+![oauth2-proxy env configured](./screenshots/32-oauth2proxy-env-configured.png)
+
+*Environment file populated with real Entra ID credentials (secret value redacted).*
+
+![oauth2-proxy active](./screenshots/33-oauth2proxy-active.png)
+
+*oauth2-proxy running and active with real credentials applied.*
+
+> **Note:** an initial credential-reset value was only viewed (`echo $SECRET`) but never actually inserted into the VM's config before the service was started, leaving it running with a stale/invalid secret. This was caught before testing by explicitly `grep`-checking the deployed config value rather than assuming the `systemctl enable --now` success meant the credentials were correct - a useful verification habit: **a service reporting "active" only confirms it started, not that its configuration is correct.**
+
+#### Step 3: Wire Identity Enforcement into NPMplus
+
+Setting the Auth Request field to `oauth2proxy` initially failed to save, returning a raw HTML error instead of a JSON response:
+
+![Auth Request attempt](./screenshots/34a-Auth-request.png)
+
+*Setting the Proxy Host's Auth Request field to oauth2proxy.*
+
+![Auth Request save error](./screenshots/34b-Auth-request-error.png)
+
+*Save fails with "Unexpected token '<'... is not valid JSON" - the frontend received an HTML page instead of the expected API response.*
+
+An `Auth Request Upstream` field (not mentioned in the handbook, likely specific to this NPMplus build) was confirmed safe to leave empty, since the upstream address is already supplied via container environment variable:
+
+```bash
+sudo docker exec npmplus env | grep -i AUTH_REQUEST
+```
+
+![Confirming the upstream env var](./screenshots/34c-Confirm-env-var.png)
+
+*AUTH_REQUEST_OAUTH2PROXY_UPSTREAM already correctly set on the NPMplus container.*
+
+NPMplus's own logs revealed the actual cause: CrowdSec's WAF was blocking NPMplus's **own** admin API request, since the SSH tunnel's traffic reaches NPMplus as `127.0.0.1`, which had been banned by an earlier appsec decision - the exact failure mode the Day 2 handbook had warned could recur:
+
+```bash
+sudo docker logs npmplus --tail 30
+```
+
+![NPMplus logs showing CrowdSec blocking its own request](./screenshots/34d-NPMplus-logs.png)
+
+*Log line `[Crowdsec] denied '127.0.0.1' with 'ban' (by appsec)` on the exact PUT request attempting to save the Auth Request setting - the WAF was blocking its own management traffic.*
+
+The documented workaround (temporarily disabling CrowdSec, saving the change, then re-enabling it) resolved this:
+
+```bash
+sudo sed -i 's/^ENABLED=.*/ENABLED=false/' /opt/npmplus/crowdsec/crowdsec.conf
+cd /opt/npmplus && sudo docker compose restart npmplus
+# ... save the Auth Request setting here ...
+sudo sed -i 's/^ENABLED=.*/ENABLED=true/' /opt/npmplus/crowdsec/crowdsec.conf
+cd /opt/npmplus && sudo docker compose restart npmplus
+```
+
+![Temporary WAF disable](./screenshots/34e-temp-fix.png)
+
+*Temporarily disabling CrowdSec to allow the admin change to save.*
+
+![WAF re-enabled](./screenshots/34f-enable-WAF.png)
+
+*Re-enabling CrowdSec once the Auth Request configuration was saved successfully.*
+
+#### Step 4: Test the Identity Gate
+
+Unauthenticated requests, both with no token and with a garbage bearer token, were correctly redirected to Microsoft sign-in rather than reaching the application:
+
+```powershell
+curl.exe -i https://lee.westeurope.cloudapp.azure.com/
+curl.exe -i -H "Authorization: Bearer garbage" https://lee.westeurope.cloudapp.azure.com/
+```
+
+![Unauthenticated request redirected to login](./screenshots/35-unauth-redirect-to-login.png)
+
+*Both an unauthenticated request and one with an invalid bearer token return an identical 302 redirect to /oauth2/sign_in - a malformed token receives no special treatment.*
+
+A real browser login initially failed with a `500 Internal Server Error` immediately after Microsoft authentication succeeded:
+
+![Browser login attempt](./screenshots/37a-browser-login.png)
+
+![500 error after login](./screenshots/37b-error.png)
+
+*Microsoft authentication succeeds, but oauth2-proxy fails to complete the session with a 500 error.*
+
+`journalctl` logs identified the exact cause: `neither the id_token nor the profileURL set an email` - the classroom Entra ID account's token did not populate a standard `email` claim, which oauth2-proxy required by default to identify the user:
+
+```bash
+sudo journalctl -u oauth2-proxy -n 50 --no-pager
+```
+
+![Log showing missing email claim](./screenshots/37c-log.png)
+
+*Root cause identified: oauth2-proxy could not extract an email claim from this account's ID token.*
+
+The fix mapped identity to the `preferred_username` claim instead (reliably populated for this account type) and allowed it to be treated as unverified:
+
+```bash
+sudo bash -c 'cat >> /etc/oauth2-proxy/oauth2-proxy.env << EOF
+OAUTH2_PROXY_OIDC_EMAIL_CLAIM=preferred_username
+OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL=true
+OAUTH2_PROXY_WHITELIST_DOMAIN=lee.westeurope.cloudapp.azure.com
+EOF'
+sudo systemctl restart oauth2-proxy
+```
+
+![Fixing the empty claim fields](./screenshots/37d-fix-empty-fields.png)
+
+*Adding the missing claim-mapping and whitelist-domain settings.*
+
+A fresh login attempt then completed successfully:
+
+![Browser login success](./screenshots/37e-browser-login-success.png)
+
+*Real Entra ID login completes and the application loads normally under the identity gate.*
+
+#### Step 5: Re-test Day 2's WAF Now That Identity Is Layered On
+
+The same SQL injection payload from Day 2 was sent unauthenticated, and then again from the already-authenticated browser session:
+
+```powershell
+curl.exe -i "https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT+*+FROM+users"
+```
+
+![Unauthenticated retest returns 302, not 403](./screenshots/38-waf-retest-302-not-403.png)
+
+*The same payload that returned 403 on Day 2 now returns 302 (redirect to login) - the Auth Request check runs before the WAF on this location, so an unauthenticated attacker never reaches the WAF at all.*
+
+```
+https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT+*+FROM+users
+```
+*(pasted directly into the already-logged-in browser tab)*
+
+![Authenticated retest still blocked by WAF](./screenshots/39-waf-retest-authenticated-403.png)
+
+*With a valid session, the request passes the identity gate and reaches the WAF, which still correctly blocks it with 403 Forbidden.*
+
+This confirms the core lesson of the day: **identity verifies who is making a request; the WAF verifies how the request behaves.** They operate at different layers and only see traffic that passed the layer in front of them - an anonymous attacker is stopped before ever reaching the WAF, while an attacker with a valid (or stolen) session is still caught by it. Removing either layer leaves a distinct, unrelated gap; neither one is redundant given the other.
+
+---
 # **4. Analysis & Submission Questions**
 
 **Why is RBAC required in addition to a managed identity and the AADSSHLoginForLinux extension?**
@@ -236,6 +479,18 @@ The WAF's signature-matching rules for the SQL injection attack category did not
 
 **Does the WAF bypass mean the application itself is vulnerable to SQL injection?**
 Not necessarily, and this is an important distinction: the WAF is one layer of defense, separate from whether the application's own code uses parameterized queries (safe) or constructs raw SQL (exploitable). A WAF failing to block a payload does not, by itself, prove the underlying application is vulnerable - it only means that if the application were vulnerable, this specific bypass could reach it without being flagged in real time.
+
+**Why did `az ad app create` fail with "Insufficient privileges" even though the account holds a valid Entra ID role?**
+The error was misleading. The actual cause was a display-name collision with existing applications in a shared classroom tenant - Azure CLI attempted to patch an existing app with the same name rather than create a new one, and the account was not an owner of either existing app. Verifying with read-only ownership checks (`az ad app owner list`) before assuming a role/permissions problem was the key diagnostic step; a unique display name resolved it without any role change.
+
+**Why did the browser login fail with a 500 error even after Microsoft authentication succeeded?**
+oauth2-proxy requires an `email` claim by default to establish a user's session identity. This classroom Entra ID account's token did not populate a standard `email` claim, so oauth2-proxy had nothing to build a session from. Mapping identity to `preferred_username` (a claim reliably present for this account type) resolved it - a reminder that not every real-world identity provider or account type populates every "standard" claim a tool expects by default.
+
+**Why did enabling the Auth Request setting in NPMplus initially fail to save?**
+CrowdSec's WAF was blocking NPMplus's own admin API request (the SSH tunnel's traffic reaches NPMplus as `127.0.0.1`, previously banned by an earlier appsec decision from Day 2 testing) - the same interference pattern the Day 2 handbook explicitly warned could recur. This was not a configuration mistake in the Auth Request setting itself, but a security tool blocking its own management plane, diagnosed by reading the proxy's own logs rather than assuming the UI field was wrong.
+
+**Why did the same attack payload return a different status code before and after Day 3's changes?**
+Before Day 3, the WAF was the only layer inspecting the request, so a malicious payload was evaluated and blocked (`403`) regardless of who sent it. After Day 3, the Auth Request (identity) check runs *first* on the same location - an unauthenticated request is redirected to login (`302`) before it ever reaches the WAF, so the WAF never even evaluates it. This is not a security regression: an authenticated attacker's identical payload still reaches the WAF and is still blocked (`403`), proving both layers remain active - they simply inspect different, sequential slices of incoming traffic.
 
 ### Explanation
 
