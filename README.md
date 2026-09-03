@@ -1,4 +1,4 @@
-Note: Note: This is the lab report. For app deployment instructions, see Base Deployment instead.
+Note: This is the lab report. For app deployment instructions, see Base Deployment instead.
 
 # LearningSteps Lockdown
 
