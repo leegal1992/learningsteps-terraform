@@ -20,8 +20,13 @@ The key result was not just completing the prescribed steps, but discovering two
 Day 3 (Identity-Based API Access)
 
 Day 3 deployed oauth2-proxy behind NPMplus to require a valid Entra ID token before any request reaches the app, replacing anonymous access entirely.
-Nearly every step surfaced a real bug rather than a scripted one: a misleading "insufficient privileges" error was actually a tenant display-name collision; a successful Microsoft login still failed with a 500 due to a missing email claim on the classroom account; and saving one NPMplus setting failed because the WAF was blocking its own admin traffic. The key confirming result: the same SQLi payload now returns 302 (redirect to login) when unauthenticated but 403 when sent from a logged-in session — proof identity and the WAF are complementary layers, not redundant ones.
+Nearly every step surfaced a real bug rather than a scripted one: a misleading "insufficient privileges" error was actually a tenant display-name collision; a successful Microsoft login still failed with a 500 due to a missing email claim on the classroom account; and saving one NPMplus setting failed because the WAF was blocking its own admin traffic. The key confirming result: the same SQLi payload now returns 302 (redirect to login) when unauthenticated but 403 when sent from a logged-in session - proof identity and the WAF are complementary layers, not redundant ones.
 
+Day 4 (Data Isolation)
+
+Day 4 migrated the PostgreSQL database off the public internet entirely, moving it onto Azure VNet Integration so it's reachable only from inside the virtual network - following a genuine backup-first migration, not a reversible toggle, since networking mode can only be set at server creation.
+
+The most useful finding was operational rather than conceptual: the local Windows psql client was silently blocked by Windows Smart App Control, with no reliable unblock path short of a full OS reset - resolved by running the backup and verification steps from Azure Cloud Shell instead, which still proved external reachability without depending on one machine's security posture. The migration itself went cleanly: the database was destroyed and recreated inside a private subnet, the backup was restored via the VM (the only resource with network access to the now-private database), and the application recovered with zero data loss - confirming the VM's connection string was built to survive the underlying server being replaced. A direct connection attempt from outside the VNet afterward failed to even resolve the hostname, a stronger and cleaner isolation result than a mere connection refusal.
 
 ---
 # **2. Tools & Environment**
@@ -469,6 +474,168 @@ https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT+*+FROM+users
 This confirms the core lesson of the day: **identity verifies who is making a request; the WAF verifies how the request behaves.** They operate at different layers and only see traffic that passed the layer in front of them - an anonymous attacker is stopped before ever reaching the WAF, while an attacker with a valid (or stolen) session is still caught by it. Removing either layer leaves a distinct, unrelated gap; neither one is redundant given the other.
 
 ---
+
+### Day 4 - Data Isolation
+
+**Goal:** migrate the database off the public internet onto Azure VNet Integration - reachable only from inside the virtual network - and practice a real, backup-first migration while doing it.
+
+**Baseline:** the database was public from the very first deployment - `postgresql.tf` originally provisioned it with a wide-open firewall rule (`0.0.0.0`–`255.255.255.255`).
+
+#### Step 1: Confirm the Database Is Public
+
+A direct connection was attempted straight from a client machine - no VM, no tunnel:
+
+```bash
+psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_journal sslmode=require"
+```
+
+> **Note:** the local Windows machine's `psql` client was blocked from launching by Windows Smart App Control (a stricter, newer Windows security feature), with no clear unblock path available and no way to safely disable it (disabling Smart App Control is one-way and requires a full Windows reset). **Azure Cloud Shell** was used instead - a legitimate substitute here, since the point of this test is proving the database is reachable from *outside* the private network being built in Step 3, not specifically that the request comes from this physical laptop.
+
+![DB public - confirmed reachable and listable](./screenshots/40-db-public-confirmed.png)
+
+*Direct connection from outside the VNet (Azure Cloud Shell) succeeds and lists tables - confirming the database is fully public.*
+
+#### Step 2: Back Up the Database
+
+Client/server version compatibility was confirmed before dumping (Cloud Shell ships a compatible `pg_dump` by default):
+
+```bash
+pg_dump --version
+```
+
+![pg_dump version check](./screenshots/41-pgdump-version-check.png)
+
+*Confirming a compatible pg_dump client version before attempting the dump.*
+
+```bash
+pg_dump "postgresql://psqladmin@psql-lee.postgres.database.azure.com/learning_journal?sslmode=require" > learningsteps_backup.sql
+ls -lh learningsteps_backup.sql
+```
+
+![Backup verified non-empty](./screenshots/42-backup-verified-nonempty.png)
+
+*Backup file created and confirmed non-empty (~16 KB) before proceeding - there is no undo once the migration runs.*
+
+The backup was then downloaded from Cloud Shell to the local machine, to be used later for the restore step:
+
+![Backup downloaded locally](./screenshots/43-backup-downloaded.png)
+
+*Backup file downloaded from Cloud Shell to the local machine via the built-in file transfer option.*
+
+#### Step 3: Migrate to VNet Integration (Backup-First Practice)
+
+With a verified backup in hand, the disruptive migration was performed. A new delegated subnet and private DNS zone were added in `network.tf`:
+
+```hcl
+resource "azurerm_subnet" "db" {
+  name                 = "snet-db"
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = ["10.0.2.0/24"]
+
+  delegation {
+    name = "postgresql"
+    service_delegation {
+      name    = "Microsoft.DBforPostgreSQL/flexibleServers"
+      actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+    }
+  }
+}
+
+resource "azurerm_private_dns_zone" "postgres" {
+  name                = "privatelink.postgres.database.azure.com"
+  resource_group_name = azurerm_resource_group.main.name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "postgres" {
+  name                  = "postgres-dns-link"
+  resource_group_name   = azurerm_resource_group.main.name
+  private_dns_zone_name = azurerm_private_dns_zone.postgres.name
+  virtual_network_id    = azurerm_virtual_network.main.id
+}
+```
+
+In `postgresql.tf`, the open firewall rule was removed and the server was set to private, delegated access:
+
+```hcl
+  public_network_access_enabled = false
+  delegated_subnet_id           = azurerm_subnet.db.id
+  private_dns_zone_id           = azurerm_private_dns_zone.postgres.id
+  depends_on                    = [azurerm_private_dns_zone_virtual_network_link.postgres]
+```
+
+`vm.tf`'s `depends_on` was updated to no longer reference the now-deleted firewall rule, preventing a "reference to undeclared resource" failure.
+
+```bash
+terraform plan
+```
+
+![Server will be replaced, public access disabled](./screenshots/44a-terraform-flexible_server.main-replaced-public_network_access_enabled-false.png)
+
+*Plan confirms the PostgreSQL server will be replaced (delegated_subnet_id forces recreation), with public_network_access_enabled flipping from true to false.*
+
+![New DNS zone and VNet link will be created](./screenshots/44b-terraform-private_dns_zone-virtual_network_link-will-be-created.png)
+
+*The new private DNS zone and its VNet link are queued for creation, enabling internal-only name resolution for the database.*
+
+![Old firewall rule will be destroyed](./screenshots/44c-terraform-firewall_rule.allow_all-will-be-destroyed.png)
+
+*The original "allow all IPs" firewall rule is destroyed, since it becomes irrelevant once public access is disabled entirely.*
+
+Critically, the plan showed the VM itself receiving only an in-place tag update, not a replacement - confirming the migration would not disturb the already-configured Docker/NPMplus/CrowdSec/oauth2-proxy stack on the VM.
+
+```bash
+terraform apply
+```
+
+![Migration applied successfully](./screenshots/45-terraform-apply-migration-done.png)
+
+*Apply completes: the database is destroyed and recreated inside the private subnet, public access is closed, and the VM remains untouched throughout.*
+
+#### Step 4: Restore and Verify Isolation
+
+With the database now unreachable from outside the VNet, the backup was copied to the VM and restored from there, over the identity-verified SSH channel from Day 1:
+
+```bash
+scp -F azssh_config learningsteps_backup.sql <vm-ip>:/tmp/
+```
+
+![Backup copied to the VM](./screenshots/46a-backup-copied.png)
+
+*Backup file transferred to the VM, the only place with network access to the now-private database.*
+
+```bash
+psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_journal sslmode=require" -f /tmp/learningsteps_backup.sql
+```
+
+![Restore executed](./screenshots/46b-restore-executed.png)
+
+*Restore completes; COPY 2 confirms both seeded journal entries were successfully restored. The numerous "no privileges were granted" warnings are expected and harmless - they relate to internal PostgreSQL system-catalog grants that Azure's managed service does not permit re-granting, and do not affect application data.*
+
+Isolation was then verified by repeating Step 1's exact connection attempt from outside the VNet:
+
+```bash
+psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_journal sslmode=require"
+```
+
+![External connection now fails to resolve](./screenshots/47-isolation-verified-external-fails.png)
+
+*The hostname no longer resolves at all from outside the VNet ("could not translate host name") - a stronger and cleaner result than a mere connection refusal, since the private DNS zone serving this name simply does not exist outside the virtual network.*
+
+#### Step 5: Confirm the App Recovered
+
+Finally, the application itself - not just the database - was confirmed working, by requesting the live endpoint in a browser:
+
+```
+https://lee.westeurope.cloudapp.azure.com/entries
+```
+
+![App recovered with restored data](./screenshots/48-app-recovered-entries-restored.png)
+
+*The application successfully serves both original seeded journal entries after the migration - confirming full recovery with zero data loss, and that the VM's connection string (built from the static server name rather than a live database attribute) survived the underlying server being replaced.*
+
+
+---
 # **4. Analysis & Submission Questions**
 
 **Why is RBAC required in addition to a managed identity and the AADSSHLoginForLinux extension?**
@@ -497,6 +664,18 @@ CrowdSec's WAF was blocking NPMplus's own admin API request (the SSH tunnel's tr
 
 **Why did the same attack payload return a different status code before and after Day 3's changes?**
 Before Day 3, the WAF was the only layer inspecting the request, so a malicious payload was evaluated and blocked (`403`) regardless of who sent it. After Day 3, the Auth Request (identity) check runs *first* on the same location - an unauthenticated request is redirected to login (`302`) before it ever reaches the WAF, so the WAF never even evaluates it. This is not a security regression: an authenticated attacker's identical payload still reaches the WAF and is still blocked (`403`), proving both layers remain active - they simply inspect different, sequential slices of incoming traffic.
+
+**Why did adding `delegated_subnet_id` and `private_dns_zone_id` force the database to be destroyed and recreated, rather than updated in place?**
+These properties are only assignable at creation time for Azure Database for PostgreSQL Flexible Server - networking mode (public vs. VNet-delegated) is a foundational characteristic of the resource, not one Azure allows changing on a live server. This is why the exercise required a full backup-first approach rather than treating it as a simple toggle.
+
+**Why did the local Windows `psql` client fail to run at all, and why was switching to Azure Cloud Shell an acceptable substitute rather than a workaround that weakens the exercise?**
+Windows Smart App Control silently blocked the executable with no actionable unblock path short of a full OS reset. Cloud Shell is still a machine entirely outside the Azure VNet being built, so it demonstrates exactly the same property Demo 1 requires - public reachability from the open internet - without depending on a single local machine's security posture.
+
+**Why did the restore need to happen from the VM rather than directly from a laptop?**
+Once `public_network_access_enabled` was set to false, the database's DNS name only resolves inside the VNet via the newly created private DNS zone. The VM is the only resource in this environment that sits inside that VNet, making it the only place capable of reaching the database at all after the migration.
+
+**Why did the application recover successfully without any manual reconfiguration, despite the database being fully destroyed and recreated?**
+The VM's connection string was built from the statically-known server name (`psql-lee.postgres.database.azure.com`) rather than a live Terraform attribute tied to the old server's identity. Had it referenced the database's `.fqdn` output directly, that value would have become "known after apply," and since any change to `custom_data` forces VM replacement, the migration could have cascaded into destroying and recreating the entire VM - wiping the manually-installed Docker/NPMplus/CrowdSec/oauth2-proxy stack along with it. This was avoided by design.
 
 ### Explanation
 
