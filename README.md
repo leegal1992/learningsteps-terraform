@@ -1,4 +1,4 @@
-Note: This README serves as the lab report and documentation for the LearningSteps Lockdown exercise (Days 1-4). If you're looking to deploy the application itself, see Base Deployment instead - this file focuses on the security hardening process, findings, and analysis, not the initial setup steps.
+Note: Note: This is the lab report. For app deployment instructions, see Base Deployment instead.
 
 # LearningSteps Lockdown
 
