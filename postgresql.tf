@@ -8,6 +8,11 @@ resource "azurerm_postgresql_flexible_server" "main" {
   sku_name               = "B_Standard_B1ms"
   storage_mb             = 32768
   zone                   = "1"
+  public_network_access_enabled = false
+  delegated_subnet_id           = azurerm_subnet.db.id
+  private_dns_zone_id           = azurerm_private_dns_zone.postgres.id
+
+  depends_on = [azurerm_private_dns_zone_virtual_network_link.postgres]
 
   # Public by design at baseline — Day 4 migrates this to Private Link
   # live. Do not add public_network_access_enabled/delegated_subnet_id/
@@ -15,12 +20,12 @@ resource "azurerm_postgresql_flexible_server" "main" {
   # exercise. See handbook.md Day 4.
 }
 
-resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_all" {
-  name             = "allow-all"
-  server_id        = azurerm_postgresql_flexible_server.main.id
-  start_ip_address = "0.0.0.0"
-  end_ip_address   = "255.255.255.255"
-}
+#resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_all" {
+#  name             = "allow-all"
+#  server_id        = azurerm_postgresql_flexible_server.main.id
+#  start_ip_address = "0.0.0.0"
+#  end_ip_address   = "255.255.255.255"
+#}
 
 resource "azurerm_postgresql_flexible_server_database" "app" {
   name      = var.db_name
