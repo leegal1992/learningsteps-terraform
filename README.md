@@ -11,67 +11,59 @@ Note: This is the lab report. For app deployment instructions, see Base Deployme
 **Exercise:** LearningSteps Lockdown
 
 ---
-# **1. Summary of Findings**
 
-Day 1 (Locking Down Management Access) & Day 2 (Encryption and a Web Application Firewall)
+## 1. Summary of Findings
 
-This exercise hardened the LearningSteps environment (a FastAPI application backed by PostgreSQL, deployed on Azure via Terraform) across its first two attack surfaces: management access (SSH) and public web access (HTTP/TLS/WAF). Day 1 replaced a wide-open, key-based SSH configuration with identity-based login via Microsoft Entra ID, and restricted network access to a single trusted IP address. Day 2 stood up the application's first public entry point, closed a plaintext HTTP gap with a real Let's Encrypt TLS certificate, and enabled a Web Application Firewall (CrowdSec, running the OWASP Core Rule Set) to block SQL injection and cross-site scripting (XSS) attempts.
+This week I worked on hardening the LearningSteps environment, a FastAPI app with a PostgreSQL database running on Azure, deployed with Terraform. When I started, almost nothing was protected. SSH was open to any IP, the app had no encryption or WAF, the API accepted requests from anyone with no login at all, and the database was reachable straight from the public internet with a wide open firewall rule.
 
-The key result was not just completing the prescribed steps, but discovering two real, unplanned security findings along the way. First, a WAF bypass: a SQL injection payload using '+' to encode spaces (id=1+UNION+SELECT...) passed through the WAF undetected in real time, while the logically identical payload using proper percent-encoding (%20) was correctly blocked - demonstrating that signature-based WAFs are encoding-sensitive and do not guarantee protection against all representations of the same attack. Second, unsolicited internet-scanning traffic was observed hitting the VM from an unrelated IP address (Contabo GmbH, France) within hours of the environment becoming public, using a spoofed, over a decade old browser User-Agent string - direct evidence that any publicly reachable service is found and probed by automated actors almost immediately, independent of anything the operator does.
+Over the four days I locked each of these down one at a time. First I replaced the open SSH access with identity based login through Entra ID and restricted the network rule to my own IP. Then I gave the app a real public entry point with TLS and a web application firewall. After that I put an identity gate in front of the API so requests need a valid Entra ID login before they reach the app at all. Finally I moved the database off the public internet completely, using a proper backup first migration instead of just flipping a setting.
 
-Day 3 (Identity-Based API Access)
+Along the way I ran into a lot of real problems that were not just following the handbook step by step. I found a way to sneak a SQL injection payload past the WAF just by encoding spaces as `+` instead of `%20`. I saw an actual unrelated scanner hit my VM from an IP in France a few hours after it went public. I hit a tenant naming collision that gave a misleading permissions error, a missing email claim that broke my login with a 500 error, and a case where the WAF was blocking its own admin panel. None of these were planned, they came up while I was working through the demos, and figuring them out helped me actually understand why each layer exists rather than just typing commands from a page.
 
-Day 3 deployed oauth2-proxy behind NPMplus to require a valid Entra ID token before any request reaches the app, replacing anonymous access entirely.
-Nearly every step surfaced a real bug rather than a scripted one: a misleading "insufficient privileges" error was actually a tenant display-name collision; a successful Microsoft login still failed with a 500 due to a missing email claim on the classroom account; and saving one NPMplus setting failed because the WAF was blocking its own admin traffic. The key confirming result: the same SQLi payload now returns 302 (redirect to login) when unauthenticated but 403 when sent from a logged-in session - proof identity and the WAF are complementary layers, not redundant ones.
+## 2. Tools & Environment
 
-Day 4 (Data Isolation)
+- Operating System (client): Windows 11
+- Cloud Provider: Microsoft Azure
+- Infrastructure as Code: Terraform
+- CLI Tools: Azure CLI (az), PowerShell, OpenSSH for Windows, curl.exe
+- Target VM: Ubuntu 22.04 LTS (vm-lee), Azure Linux Virtual Machine
+- Identity: Microsoft Entra ID (Azure AD), Virtual Machine Administrator Login role
+- Reverse Proxy / Certificate Management: NPMplus (Nginx Proxy Manager, extended build)
+- TLS Certificate Authority: Let's Encrypt
+- Web Application Firewall: CrowdSec (OWASP Core Rule Set, AppSec component)
+- Database: Azure Database for PostgreSQL Flexible Server (psql-lee)
+- Version Control: Git / GitHub Desktop
 
-Day 4 migrated the PostgreSQL database off the public internet entirely, moving it onto Azure VNet Integration so it's reachable only from inside the virtual network - following a genuine backup-first migration, not a reversible toggle, since networking mode can only be set at server creation.
+## 3. Execution & Procedures
 
-The most useful finding was operational rather than conceptual: the local Windows psql client was silently blocked by Windows Smart App Control, with no reliable unblock path short of a full OS reset - resolved by running the backup and verification steps from Azure Cloud Shell instead, which still proved external reachability without depending on one machine's security posture. The migration itself went cleanly: the database was destroyed and recreated inside a private subnet, the backup was restored via the VM (the only resource with network access to the now-private database), and the application recovered with zero data loss - confirming the VM's connection string was built to survive the underlying server being replaced. A direct connection attempt from outside the VNet afterward failed to even resolve the hostname, a stronger and cleaner isolation result than a mere connection refusal.
+### Locking down SSH access
 
----
-# **2. Tools & Environment**
+The first thing I looked at was how the VM could be reached. Terraform had already set up a system assigned managed identity on the VM and installed the AADSSHLoginForLinux extension, so most of the plumbing for identity based login was already there. What was missing was the actual role assignment. Just being Owner on the subscription is not enough to log into a VM's operating system, Azure keeps that as a separate permission, so I had to explicitly grant myself the Virtual Machine Administrator Login role scoped to the VM.
 
-- **Operating System (client):** Windows 11
-- **Cloud Provider:** Microsoft Azure
-- **Infrastructure as Code:** Terraform
-- **CLI Tools:** Azure CLI (az), PowerShell, OpenSSH for Windows, curl.exe
-- **Target VM:** Ubuntu 22.04 LTS (vm-lee), Azure Linux Virtual Machine
-- **Identity:** Microsoft Entra ID (Azure AD), Virtual Machine Administrator Login role
-- **Reverse Proxy / Certificate Management:** NPMplus (Nginx Proxy Manager, extended build)
-- **TLS Certificate Authority:** Let's Encrypt
-- **Web Application Firewall:** CrowdSec (OWASP Core Rule Set, AppSec component)
-- **Database:** Azure Database for PostgreSQL Flexible Server (psql-lee)
-- **Version Control:** Git / GitHub Desktop
-
-# **3. Execution & Procedures**
-
-## Day 1 - Locking Down Management Access
-
-Goal: replace static SSH key authentication with identity-based login via Entra ID, and restrict the network path to SSH to a single trusted IP address.
-
-### Step 1: Grant Entra ID VM Login Role and Authenticate
-
-The VM was already provisioned with a system-assigned managed identity and the AADSSHLoginForLinux extension by Terraform. The remaining prerequisite - granting the account the 'Virtual Machine Administrator Login' RBAC role scoped to the VM resource - is not automated and had to be applied manually, since Owner/Contributor rights on the subscription do not by themselves permit OS-level login.
+```powershell
+$VM_ID = az vm show --resource-group rg-lee --name vm-lee --query id -o tsv
+az role assignment create --assignee lee.gal@cybersteps.onmicrosoft.com `
+  --role "Virtual Machine Administrator Login" --scope $VM_ID
+```
 
 ![RBAC role assignment confirmation](./screenshots/01-RBAC-confirmation.png)
 
-Confirmation that the Virtual Machine Administrator Login role assignment landed correctly, scoped to vm-lee.
-Login was then performed using the Entra ID identity directly, with no SSH key file involved:
+This confirms the role landed correctly on the VM resource.
+
+Once that was in place I could log in with my own identity instead of a key file.
+
 ```powershell
 az ssh vm --resource-group rg-lee --name vm-lee
 ```
+
 ![Entra ID SSH login](./screenshots/02-EntraID-SSH-login.png)
 
-Successful SSH login to vm-lee authenticated via Entra ID identity rather than a static key.
-### Step 2: Restrict SSH to a Trusted IP
-The NSG's 'allow-ssh' rule initially permitted SSH (port 22) from any IP address ('"*"'), identified in 'network.tf' as the root cause of unrestricted management-plane exposure.
+The second part of locking this down was the network side. The NSG rule for SSH originally allowed traffic from any IP at all, which is basically an open invitation for brute force bots that scan the internet for port 22 constantly.
 
 ![NSG rule before](./screenshots/03-source_address_prefix-before.png)
 
-network.tf before the change: source_address_prefix set to "" - SSH reachable from any IP on the internet.*
-The public IP was obtained and the rule updated to allow only that single address:
+I got my own public IP and updated the rule so only that address could reach SSH.
+
 ```powershell
 curl.exe -s -4 ifconfig.me
 # -> e.g. 79.196.253.208
@@ -79,84 +71,82 @@ curl.exe -s -4 ifconfig.me
 # network.tf
 source_address_prefix = "79.196.253.208/32"
 ```
+
 ![NSG rule after](./screenshots/04-source_address_prefix-after.png)
 
-network.tf after the change: source_address_prefix restricted to a single /32 address.
+The `/32` at the end matters, it means exactly one address and not a whole range.
+
 ```powershell
 terraform apply
 ```
+
 ![Terraform plan](./screenshots/05-terraform-apply-to-change.png)
 
-Terraform plan showing only the NSG rule being modified in place.
 ![Terraform apply complete](./screenshots/06-terraform-apply-done.png)
 
-Terraform apply completed successfully; the NSG rule is now restricted.
-> **Note:** the dynamic public IP changed between sessions (ISP-assigned), causing a connection timeout on a later day. This was diagnosed by re-running the 'ifconfig.me' check, comparing it against the currently allowed NSG rule, and re-applying with the new IP - a realistic operational consequence of IP-based allow-listing.
----
-Day 2 - Encryption and a Web Application Firewall
-Goal: expose the application publicly for the first time, close the plaintext HTTP gap with real TLS, and add a Web Application Firewall to block known attack patterns before they reach the application.
-### Step 1: Confirm the App Is Alive, But Not Yet Exposed
-Using the identity-verified SSH channel from Day 1, a local tunnel confirmed the FastAPI application was running correctly on the VM, without exposing it publicly:
+One thing I ran into more than once during the week is that my home IP changes between sessions since it is not static. A few times I came back to work on the project and got a connection timeout on SSH, which turned out to just be my ISP handing me a new IP. The fix each time was checking ifconfig.me again and updating the rule, which became a normal part of starting a session rather than something surprising by the end of the week.
+
+### Encryption and a web application firewall
+
+With SSH locked down I moved on to the app itself, which had no public entry point yet at all. Before touching anything public I used the SSH access from the day before to open a tunnel and confirm the app was actually running.
+
 ```powershell
 az ssh config --resource-group rg-lee --name vm-lee --file azssh_config
 ssh -F azssh_config -L 8000:localhost:8000 <vm-ip>
 ```
+
 ![SSH tunnel](./screenshots/07-tunnel.png)
 
-SSH tunnel established from the local machine to the app's internal port (8000) on vm-lee.
 ```powershell
 curl.exe http://localhost:8000/entries
 ```
+
 ![App entries via tunnel](./screenshots/08-entries-http.png)
 
-Seeded journal entries returned as JSON, confirming the application itself is healthy while still unreachable from the public internet.
-### Step 2: Create the Public Proxy Host
-A Proxy Host was created in NPMplus mapping the VM's public FQDN to the application's internal address, with TLS deliberately left disabled at this stage:
-Domain: 'lee.westeurope.cloudapp.azure.com'
-Forward Hostname/IP: '127.0.0.1'
-Forward Port: '8000'
+The seeded journal entries came back fine, so the app itself was healthy, it just was not reachable from outside yet.
+
+I created a Proxy Host in NPMplus pointing the VM's public domain at the app's internal port, leaving TLS off for the moment on purpose.
+
 ![Proxy Host config](./screenshots/09-Proxy-Host-config.png)
 
-Proxy Host configuration in NPMplus routing the public domain to the internal FastAPI application.
-### Step 3: Confirm the Plaintext Gap
+To actually see the problem before fixing it, I sent a plain HTTP request and watched the whole response come back in the clear.
+
 ```powershell
 curl.exe -i "http://lee.westeurope.cloudapp.azure.com/entries"
 ```
+
 ![Plain HTTP 200](./screenshots/10-HTTP-request-before-200.png)
 
-200 OK returned over unencrypted HTTP - full JSON response readable by anything on the network path.
-### Step 4: Enable Real TLS
-A Let's Encrypt certificate was requested directly through the NPMplus TLS tab, with Force HTTPS enabled to redirect all plaintext traffic:
+Anyone sitting on the same network path could have read that. I requested a real Let's Encrypt certificate through the NPMplus panel and turned on Force HTTPS so plain HTTP would redirect instead of being served.
+
 ![TLS setup](./screenshots/12-TLS-setup.png)
 
-NPMplus TLS tab: requesting a new Let's Encrypt certificate with Force HTTPS enabled.
 ```powershell
 curl.exe -i https://lee.westeurope.cloudapp.azure.com/entries
 curl.exe -i "http://lee.westeurope.cloudapp.azure.com/entries"
 ```
+
 ![HTTP redirect 301](./screenshots/11-HTTP-request-after-301.png)
 
-301 Moved Permanently returned for the plain HTTP request, redirecting to HTTPS.
 ![HTTPS 200 and HTTP 301 pair](./screenshots/13-after-TLS-200-301.png)
 
-Side-by-side confirmation: HTTPS returns 200 OK with a valid certificate; HTTP now redirects (301) instead of serving content directly.
-### Step 5: Enable the Web Application Firewall
-Before enabling the WAF, two known attack payloads were sent to confirm they passed through unobstructed:
+After that I turned to the WAF. First I confirmed there was nothing stopping an attack payload from getting through at all.
+
 ```powershell
 curl.exe -i "https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT+*+FROM+users"
 curl.exe -i "https://lee.westeurope.cloudapp.azure.com/entries?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
 ```
+
 ![SQLi and XSS before WAF](./screenshots/14-SQL-injection-XSS-before-WAF.png)
 
-Both a SQL injection payload and an XSS payload return 200 OK with no WAF active - the gap being demonstrated.
-CrowdSec's bouncer was registered against the NPMplus proxy:
+Both a SQL injection style payload and an XSS payload went straight through with a normal 200 response. I registered CrowdSec's bouncer against NPMplus, which gave me a one time API key I had to paste into the config right away since it cannot be viewed again.
+
 ```bash
 sudo docker exec crowdsec cscli bouncers add npmplus
 ```
+
 ![CrowdSec bouncer enable](./screenshots/15-CrowdSec-bouncer-enable.png)
 
-CrowdSec bouncer registration, producing a one-time API key (redacted) used to authorize NPMplus to query CrowdSec's decision engine.
-The generated API key was inserted into the CrowdSec configuration, and the container restarted to apply it:
 ```bash
 sudo nano /opt/npmplus/crowdsec/crowdsec.conf
 #   ENABLED=true
@@ -166,80 +156,69 @@ sudo nano /opt/npmplus/crowdsec/crowdsec.conf
 
 cd /opt/npmplus && sudo docker compose restart npmplus
 ```
+
 ![crowdsec.conf before](./screenshots/16-crowdsec-before.png)
 
-crowdsec.conf prior to editing - ENABLED and API_KEY fields still at their default/placeholder state.
 ![crowdsec.conf edited](./screenshots/17-crowdsec-edited.png)
 
-crowdsec.conf after editing - ENABLED=true and API_KEY populated with the bouncer's key.
-### Step 6: Investigate an Inconsistent Block Result
-Re-sending the original two payloads after enabling the WAF produced an unexpected, inconsistent result: the XSS payload was blocked ('403 Forbidden'), but the SQL injection payload still returned '200 OK', despite CrowdSec's own alert log showing both had been detected with an identical anomaly score of 40.
+When I re-sent the same two payloads after this, I got a result I did not expect. The XSS one was blocked with a 403 like it should be, but the SQL injection one still came back 200, even though CrowdSec's own alert log showed both had been picked up with the exact same anomaly score.
+
 ```bash
 sudo docker exec crowdsec cscli alerts list
 ```
-![CrowdSec alert list](./screenshots/18-CrowdSec-alert-list.png)
 
-CrowdSec alert log showing both attacks detected (anomaly score 40) but with no active "decisions" recorded for either - the first clue that detection and enforcement were not yet aligned.
-WAF signature matching is encoding-sensitive; + -encoded payloads bypassed detection while percent-encoded equivalents were blocked – a reminder that WAFs provide pattern-based defense, not a guarantee against all encodings of the same attack
+![CrowdSec alert list](./screenshots/18-CrowdSec-alert-list.png)
 
 ![SQL not blocked, XSS blocked](./screenshots/19-sql-notblocked-xxs-blocked.png)
 
-Re-test after enabling the WAF: the XSS payload returns 403 Forbidden, while the SQL injection payload still returns 200 OK.
-To diagnose this, the AppSec configuration files inside the CrowdSec container were inspected, to check whether SQL injection detection was running out-of-band (log-only) rather than in-band (blocking):
+I spent a while checking whether the SQL injection detection was somehow only running in an out of band, alert only mode instead of actually blocking.
+
 ```bash
 sudo docker exec crowdsec cat /etc/crowdsec/appsec-configs/crs-inband.yaml
 sudo docker exec crowdsec cat /etc/crowdsec/appsec-configs/crs.yaml
 ```
+
 ![crs-inband local config](./screenshots/20-crs-inband-local.png)
 
-Both the in-band (blocking) and out-of-band (alert-only) AppSec configs reference the same crowdsecurity/crs ruleset - ruling out a pipeline/routing misconfiguration.
 ![Investigating the ruleset](./screenshots/21-looking-for-ruleset-mistake.png)
 
-Investigation into the CRS ruleset behavior to isolate why one payload type was blocked and the other was not.
-### Step 7: Root Cause - Encoding-Sensitive Rule Matching
-The two original payloads differed in how they encoded spaces: the SQL injection payload used literal '+' characters, while the XSS payload used standard percent-encoding throughout. Re-sending the SQL injection payload with proper percent-encoding ('%20') instead of '+' resulted in an immediate block:
+Both configs pointed at the same ruleset, so that was not it. Looking closer at the two payloads, I noticed they encoded spaces differently. The SQL injection one used plain `+` characters and the XSS one used proper percent encoding all the way through. I tried sending the SQL injection payload again but with `%20` instead of `+`, and it was blocked immediately.
+
 ```powershell
 curl.exe -i "https://lee.westeurope.cloudapp.azure.com/entries?id=1%20UNION%20SELECT%20*%20FROM%20users"
 ```
+
 ![SQL and XSS now 403](./screenshots/22-sql-xxs-403-forbidden.png)
 
-The percent-encoded SQL injection payload is now blocked with 403 Forbidden, confirming the root cause was encoding-sensitive signature matching rather than a configuration fault.
+So the actual issue was that the WAF's rule for this attack pattern was not recognizing `+` as an equivalent to a space, even though the app itself decodes them identically. This does not mean the app is definitely vulnerable to SQL injection, that depends on whether the backend code uses parameterized queries or not, but it does mean this specific WAF rule had a real, exploitable blind spot based purely on how the attacker encodes the request. It was a genuinely useful thing to stumble into, since it shows a WAF being switched on and correctly configured is not the same thing as a WAF catching everything.
 
-
-Written explanation of the finding: '+' is a valid alternate encoding for a space in a URL query string and is decoded identically by the application, but the WAF's pattern-matching rule for this attack signature did not recognize the '+' form in real time, allowing a logically identical attack to bypass detection while its percent-encoded equivalent was blocked.
 ```bash
 sudo docker exec crowdsec cscli alerts list
 ```
+
 ![All logged and blocked](./screenshots/24-all-logged-and-blocked.png)
 
-Final alert list showing all four requests logged: the original '+'-encoded payloads (detected, not blocked) alongside the percent-encoded equivalents (detected and blocked).
+While I was in the alert log I noticed a fifth entry I had not caused myself, from an IP in France belonging to a hosting company called Contabo. It was a generic probe against the root path with a low anomaly score, sent with a User-Agent claiming to be Firefox from 2010, which is not something a real visitor would ever actually send. This was an unprompted scan from the open internet, not something I triggered, and it happened within hours of the environment going public. It was a good reminder that exposing something publicly gets it found by automated scanners almost immediately, regardless of anything I do.
 
-### Step 8: Unplanned Finding - Real Internet Scan Traffic
-While reviewing the alert log, a fifth, unprompted entry was found originating from 194.163.190.65 (Contabo GmbH, France)-an IP address not used at any point during this exercise. Inspection revealed a generic reconnaissance probe aimed at the root URI (/) with a low anomaly score of 5. The request utilized a User-Agent string identifying itself as Firefox 3.6.11 (a browser released in 2010), strongly indicating an automated scanning tool rather than a legitimate visitor. Within hours of the VM going public, automated internet scanners independently discovered the exposed endpoint with this decade-old spoofed User-Agent. This confirms that the WAF is actively capturing real-world threat traffic, rather than just the controlled test payloads sent during testing.
 ```bash
 sudo docker exec crowdsec cscli alerts inspect 4
 ```
+
 ![Blocked FR scan investigation](./screenshots/25-blocked-FR-investigation.png)
 
-Detailed inspection of the unsolicited scan: an unrelated IP hosted by Contabo GmbH probed the application's root path within hours of it becoming public, using a spoofed, obsolete User-Agent string.
-> This was not a simulated test - it is unprompted traffic from the open internet, and stands as direct evidence that a publicly reachable endpoint is discovered and probed by automated actors almost immediately after exposure, independent of any action taken by the operator.
-### Step 9: Reviewing CrowdSec's Data-Sharing Default
-Before closing out Day 2, CrowdSec's community threat-intel sharing setting was checked, since it is enabled by default and shares detected attack signals with CrowdSec's central network:
+Before moving on I also checked CrowdSec's community sharing setting, since it shares detected attack data with CrowdSec's network by default and I wanted to actually look at that rather than assume it was fine.
+
 ```bash
 sudo docker exec crowdsec cscli console status
 ```
+
 ![Console status](./screenshots/27-console-status.png)
 
-Checking whether community threat-intel sharing is active, and making a deliberate decision on whether to keep it enabled for this environment.
+### Putting an identity gate in front of the API
 
----
-### Day 3 - Identity-Based API Access
+By this point the app had encryption and a WAF, but it still accepted requests from literally anyone with no login at all. The goal here was to put oauth2-proxy behind NPMplus so nothing reaches the app without a valid Entra ID token.
 
-**Goal:** require a valid Entra ID identity token before any request reaches the application, replacing anonymous access to the API, and confirm that identity enforcement and the WAF are complementary rather than redundant.
-
-#### Step 1: Register an Entra ID Application
-
-The first attempt to register an application failed with `ERROR: Insufficient privileges to complete the operation`:
+The first attempt to register an Entra ID application for this failed right away.
 
 ```powershell
 $APP_ID = az ad app create --display-name learningsteps-oauth2-proxy `
@@ -249,9 +228,7 @@ $APP_ID = az ad app create --display-name learningsteps-oauth2-proxy `
 
 ![Insufficient privileges error](./screenshots/28-app-registration-INSUFFICIENT-PRIVILEGES.png)
 
-*Initial app registration attempt fails with an "Insufficient privileges" error.*
-
-Root cause investigation showed this was **not** a missing Entra ID role, but a **display-name collision** in a shared classroom tenant: `az ad app create` found an existing application with the same display name and attempted to patch it instead of creating a new one. Ownership checks on both existing `learningsteps-oauth2-proxy` apps confirmed neither belonged to this account - one was orphaned (no owner at all), the other belonged to a classmate:
+The error said insufficient privileges, which made me think I was missing an Entra role. After checking, it turned out this was not actually a permissions problem at all. Since this is a shared classroom tenant, someone else had already registered an app with the exact same display name, and the CLI tried to patch that existing app instead of creating a new one for me.
 
 ```powershell
 az ad app list --display-name learningsteps-oauth2-proxy --query "[].{DisplayName:displayName, AppId:appId, ObjectId:id}" -o table
@@ -262,9 +239,7 @@ az ad app owner list --id <ObjectId> --query "[].userPrincipalName" -o tsv
 
 ![Ownership check root cause continued](./screenshots/28c-ownership-check-root-cause.png)
 
-*Listing all apps with the colliding display name and checking ownership confirms neither existing app belongs to this account - the true root cause of the "insufficient privileges" error.*
-
-The fix was to use a unique display name, which registered cleanly:
+Neither existing app belonged to me, one had no owner at all and the other belonged to a classmate. Using a unique display name fixed it right away, no role changes needed.
 
 ```powershell
 $APP_ID = az ad app create --display-name learningsteps-oauth2-proxy-lee `
@@ -278,13 +253,9 @@ $TENANT_ID = az account show --query tenantId -o tsv
 
 ![App registration created](./screenshots/28d-app-registration-created.png)
 
-*Service Principal successfully created under a unique display name, avoiding the tenant-wide naming collision.*
-
 ![Confirm IDs](./screenshots/28e-confirm-id.png)
 
-*Confirming $APP_ID, $TENANT_ID, and $SECRET all resolved to real, non-empty values before proceeding.*
-
-Two required follow-up configuration steps - forcing v2.0-format access tokens, and exposing an API scope with a registered reply URL - both initially failed with `Bad Request` errors from Microsoft Graph due to a missing `Content-Type` header, which `az rest` does not always set automatically on Windows/PowerShell:
+Two more setup steps, forcing v2.0 format tokens and exposing an API scope with a redirect URL, kept failing with Bad Request errors because az rest was not sending a Content-Type header automatically on Windows.
 
 ```powershell
 az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJECT_ID" `
@@ -294,9 +265,7 @@ az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJ
 
 ![Token version set to v2](./screenshots/29-token-version-v2-set.png)
 
-*Forcing v2.0-format access tokens, once the Content-Type header was explicitly specified.*
-
-The reply URL PATCH additionally failed even with the header fix, due to a payload-parsing issue specific to `az ad app update`'s inline JSON handling on Windows; writing the JSON body to a file and referencing it with `@filename` resolved it:
+Setting the header explicitly fixed most of it, but the redirect URL update still failed even after that, this time because of how az ad app update handles inline JSON on Windows. Writing the JSON to a file first and passing that in instead solved it.
 
 ```powershell
 $redirectBody | Out-File -FilePath redirect.json -Encoding utf8 -NoNewline
@@ -307,15 +276,9 @@ az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJ
 
 ![Scope PATCH](./screenshots/30a-scope-patch.png)
 
-*Exposing the oauth2PermissionScopes API scope required for token requests.*
-
 ![Redirect URI PATCH](./screenshots/30b-redirect-uri-patch.png)
 
-*Registering the HTTPS reply URL after working around the inline-JSON parsing issue via a file-based request body.*
-
-#### Step 2: Configure and Start oauth2-proxy
-
-oauth2-proxy was confirmed pre-installed but idle before configuration:
+With the app registration sorted, I confirmed oauth2-proxy was already installed on the VM but sitting idle, waiting for real credentials.
 
 ```bash
 systemctl is-active oauth2-proxy
@@ -323,9 +286,7 @@ systemctl is-active oauth2-proxy
 
 ![oauth2-proxy inactive before configuration](./screenshots/31-oauth2proxy-inactive-before.png)
 
-*oauth2-proxy service present but correctly inactive prior to receiving real credentials.*
-
-Real credentials from Step 1 were inserted into the service's environment file, and the redirect URL was set:
+I filled in the real values and started it.
 
 ```bash
 sudo sed -i \
@@ -342,27 +303,17 @@ sudo systemctl enable --now oauth2-proxy
 
 ![oauth2-proxy env configured](./screenshots/32-oauth2proxy-env-configured.png)
 
-*Environment file populated with real Entra ID credentials (secret value redacted).*
-
 ![oauth2-proxy active](./screenshots/33-oauth2proxy-active.png)
 
-*oauth2-proxy running and active with real credentials applied.*
+At one point along the way I had only looked at the secret value with echo but never actually pasted it into the VM's config before starting the service, so it came up active while still holding an old, invalid secret. Checking the actual deployed value with grep instead of trusting that "active" meant "correct" caught this before it caused confusion later. A service reporting active only means it started, not that its settings are right.
 
-> **Note:** an initial credential-reset value was only viewed (`echo $SECRET`) but never actually inserted into the VM's config before the service was started, leaving it running with a stale/invalid secret. This was caught before testing by explicitly `grep`-checking the deployed config value rather than assuming the `systemctl enable --now` success meant the credentials were correct - a useful verification habit: **a service reporting "active" only confirms it started, not that its configuration is correct.**
-
-#### Step 3: Wire Identity Enforcement into NPMplus
-
-Setting the Auth Request field to `oauth2proxy` initially failed to save, returning a raw HTML error instead of a JSON response:
+Next I tried wiring the Auth Request setting into NPMplus so it would actually enforce the login, and saving that setting failed with a strange error about invalid JSON.
 
 ![Auth Request attempt](./screenshots/34a-Auth-request.png)
 
-*Setting the Proxy Host's Auth Request field to oauth2proxy.*
-
 ![Auth Request save error](./screenshots/34b-Auth-request-error.png)
 
-*Save fails with "Unexpected token '<'... is not valid JSON" - the frontend received an HTML page instead of the expected API response.*
-
-An `Auth Request Upstream` field (not mentioned in the handbook, likely specific to this NPMplus build) was confirmed safe to leave empty, since the upstream address is already supplied via container environment variable:
+There was also a new field called Auth Request Upstream that the handbook did not mention, which I confirmed was safe to leave empty since the upstream address was already set as an environment variable on the container.
 
 ```bash
 sudo docker exec npmplus env | grep -i AUTH_REQUEST
@@ -370,9 +321,7 @@ sudo docker exec npmplus env | grep -i AUTH_REQUEST
 
 ![Confirming the upstream env var](./screenshots/34c-Confirm-env-var.png)
 
-*AUTH_REQUEST_OAUTH2PROXY_UPSTREAM already correctly set on the NPMplus container.*
-
-NPMplus's own logs revealed the actual cause: CrowdSec's WAF was blocking NPMplus's **own** admin API request, since the SSH tunnel's traffic reaches NPMplus as `127.0.0.1`, which had been banned by an earlier appsec decision - the exact failure mode the Day 2 handbook had warned could recur:
+Checking NPMplus's own logs showed what was really happening, CrowdSec's WAF was blocking NPMplus's own request to save the setting, since my SSH tunnel's traffic shows up as 127.0.0.1 and that address had been banned earlier from testing.
 
 ```bash
 sudo docker logs npmplus --tail 30
@@ -380,29 +329,21 @@ sudo docker logs npmplus --tail 30
 
 ![NPMplus logs showing CrowdSec blocking its own request](./screenshots/34d-NPMplus-logs.png)
 
-*Log line `[Crowdsec] denied '127.0.0.1' with 'ban' (by appsec)` on the exact PUT request attempting to save the Auth Request setting - the WAF was blocking its own management traffic.*
-
-The documented workaround (temporarily disabling CrowdSec, saving the change, then re-enabling it) resolved this:
+The fix was to disable CrowdSec briefly, save the setting, then turn it back on.
 
 ```bash
 sudo sed -i 's/^ENABLED=.*/ENABLED=false/' /opt/npmplus/crowdsec/crowdsec.conf
 cd /opt/npmplus && sudo docker compose restart npmplus
-# ... save the Auth Request setting here ...
+# saved the setting here
 sudo sed -i 's/^ENABLED=.*/ENABLED=true/' /opt/npmplus/crowdsec/crowdsec.conf
 cd /opt/npmplus && sudo docker compose restart npmplus
 ```
 
 ![Temporary WAF disable](./screenshots/34e-temp-fix.png)
 
-*Temporarily disabling CrowdSec to allow the admin change to save.*
-
 ![WAF re-enabled](./screenshots/34f-enable-WAF.png)
 
-*Re-enabling CrowdSec once the Auth Request configuration was saved successfully.*
-
-#### Step 4: Test the Identity Gate
-
-Unauthenticated requests, both with no token and with a garbage bearer token, were correctly redirected to Microsoft sign-in rather than reaching the application:
+With that sorted I tested the gate itself. Sending no token at all, and sending a made up bearer token, both got redirected to Microsoft sign in the same way, so a fake token gets no special treatment.
 
 ```powershell
 curl.exe -i https://lee.westeurope.cloudapp.azure.com/
@@ -411,17 +352,13 @@ curl.exe -i -H "Authorization: Bearer garbage" https://lee.westeurope.cloudapp.a
 
 ![Unauthenticated request redirected to login](./screenshots/35-unauth-redirect-to-login.png)
 
-*Both an unauthenticated request and one with an invalid bearer token return an identical 302 redirect to /oauth2/sign_in - a malformed token receives no special treatment.*
-
-A real browser login initially failed with a `500 Internal Server Error` immediately after Microsoft authentication succeeded:
+A real browser login was more of a fight than I expected. It got past the actual Microsoft sign in screen fine, then came back with a 500 error.
 
 ![Browser login attempt](./screenshots/37a-browser-login.png)
 
 ![500 error after login](./screenshots/37b-error.png)
 
-*Microsoft authentication succeeds, but oauth2-proxy fails to complete the session with a 500 error.*
-
-`journalctl` logs identified the exact cause: `neither the id_token nor the profileURL set an email` - the classroom Entra ID account's token did not populate a standard `email` claim, which oauth2-proxy required by default to identify the user:
+The logs pointed straight at the cause, neither the id_token nor the profile URL had set an email, meaning oauth2-proxy could not figure out who I was from the token even though I had just logged in successfully.
 
 ```bash
 sudo journalctl -u oauth2-proxy -n 50 --no-pager
@@ -429,9 +366,7 @@ sudo journalctl -u oauth2-proxy -n 50 --no-pager
 
 ![Log showing missing email claim](./screenshots/37c-log.png)
 
-*Root cause identified: oauth2-proxy could not extract an email claim from this account's ID token.*
-
-The fix mapped identity to the `preferred_username` claim instead (reliably populated for this account type) and allowed it to be treated as unverified:
+The classroom account just does not populate a normal email claim in its token. I mapped identity to the preferred_username claim instead, which is reliably filled in for this kind of account.
 
 ```bash
 sudo bash -c 'cat >> /etc/oauth2-proxy/oauth2-proxy.env << EOF
@@ -444,17 +379,11 @@ sudo systemctl restart oauth2-proxy
 
 ![Fixing the empty claim fields](./screenshots/37d-fix-empty-fields.png)
 
-*Adding the missing claim-mapping and whitelist-domain settings.*
-
-A fresh login attempt then completed successfully:
+After that a fresh login worked properly.
 
 ![Browser login success](./screenshots/37e-browser-login-success.png)
 
-*Real Entra ID login completes and the application loads normally under the identity gate.*
-
-#### Step 5: Re-test Day 2's WAF Now That Identity Is Layered On
-
-The same SQL injection payload from Day 2 was sent unauthenticated, and then again from the already-authenticated browser session:
+Last thing for this part was checking whether the WAF still mattered now that there was an identity gate too. I sent the same SQL injection payload from before, but without logging in first.
 
 ```powershell
 curl.exe -i "https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT+*+FROM+users"
@@ -462,52 +391,33 @@ curl.exe -i "https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT
 
 ![Unauthenticated retest returns 302, not 403](./screenshots/38-waf-retest-302-not-403.png)
 
-*The same payload that returned 403 on Day 2 now returns 302 (redirect to login) - the Auth Request check runs before the WAF on this location, so an unauthenticated attacker never reaches the WAF at all.*
-
-```
-https://lee.westeurope.cloudapp.azure.com/entries?id=1+UNION+SELECT+*+FROM+users
-```
-*(pasted directly into the already-logged-in browser tab)*
+Instead of the 403 it gave before, it now redirected to login with a 302, since the identity check runs first and an anonymous request never even reaches the WAF anymore. Then I pasted the exact same URL into my browser tab where I was already logged in.
 
 ![Authenticated retest still blocked by WAF](./screenshots/39-waf-retest-authenticated-403.png)
 
-*With a valid session, the request passes the identity gate and reaches the WAF, which still correctly blocks it with 403 Forbidden.*
+That one still got blocked with a 403, which shows the WAF is still doing its job, it just only sees traffic that already got past the login check. That is basically the whole point of this part, identity checks who is asking and the WAF checks whether what they are asking for looks malicious, and you need both because each one only catches what the other cannot.
 
-This confirms the core lesson of the day: **identity verifies who is making a request; the WAF verifies how the request behaves.** They operate at different layers and only see traffic that passed the layer in front of them - an anonymous attacker is stopped before ever reaching the WAF, while an attacker with a valid (or stolen) session is still caught by it. Removing either layer leaves a distinct, unrelated gap; neither one is redundant given the other.
+### Moving the database off the public internet
 
----
+The database had been public since the very first deployment, with a firewall rule that let in every single IP address, `0.0.0.0` to `255.255.255.255`. The goal was to move it fully behind the VNet so only the VM can reach it, and to actually practice doing this the safe way with a backup first.
 
-### Day 4 - Data Isolation
-
-**Goal:** migrate the database off the public internet onto Azure VNet Integration - reachable only from inside the virtual network - and practice a real, backup-first migration while doing it.
-
-**Baseline:** the database was public from the very first deployment - `postgresql.tf` originally provisioned it with a wide-open firewall rule (`0.0.0.0`–`255.255.255.255`).
-
-#### Step 1: Confirm the Database Is Public
-
-A direct connection was attempted straight from a client machine - no VM, no tunnel:
+I confirmed the database really was open to the world by connecting to it straight from a client, no VM or tunnel involved.
 
 ```bash
 psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_journal sslmode=require"
 ```
 
-> **Note:** the local Windows machine's `psql` client was blocked from launching by Windows Smart App Control (a stricter, newer Windows security feature), with no clear unblock path available and no way to safely disable it (disabling Smart App Control is one-way and requires a full Windows reset). **Azure Cloud Shell** was used instead - a legitimate substitute here, since the point of this test is proving the database is reachable from *outside* the private network being built in Step 3, not specifically that the request comes from this physical laptop.
+My own Windows machine's psql client got blocked from even launching by Windows Smart App Control, and there was no clear way to unblock it without a full Windows reset, so I ran this from Azure Cloud Shell instead. That still proves the same thing the demo is asking for, since Cloud Shell is outside the VNet just like any other random machine on the internet would be.
 
-![DB public - confirmed reachable and listable](./screenshots/40-db-public-confirmed.png)
+![DB public confirmed](./screenshots/40-db-public-confirmed.png)
 
-*Direct connection from outside the VNet (Azure Cloud Shell) succeeds and lists tables - confirming the database is fully public.*
-
-#### Step 2: Back Up the Database
-
-Client/server version compatibility was confirmed before dumping (Cloud Shell ships a compatible `pg_dump` by default):
+Before touching anything I checked my local pg_dump version matched closely enough to the server, then took an actual backup.
 
 ```bash
 pg_dump --version
 ```
 
 ![pg_dump version check](./screenshots/41-pgdump-version-check.png)
-
-*Confirming a compatible pg_dump client version before attempting the dump.*
 
 ```bash
 pg_dump "postgresql://psqladmin@psql-lee.postgres.database.azure.com/learning_journal?sslmode=require" > learningsteps_backup.sql
@@ -516,17 +426,11 @@ ls -lh learningsteps_backup.sql
 
 ![Backup verified non-empty](./screenshots/42-backup-verified-nonempty.png)
 
-*Backup file created and confirmed non-empty (~16 KB) before proceeding - there is no undo once the migration runs.*
-
-The backup was then downloaded from Cloud Shell to the local machine, to be used later for the restore step:
+I made sure the file was not empty before doing anything destructive, since there is no undo once the migration runs. I downloaded it to my own machine to use later.
 
 ![Backup downloaded locally](./screenshots/43-backup-downloaded.png)
 
-*Backup file downloaded from Cloud Shell to the local machine via the built-in file transfer option.*
-
-#### Step 3: Migrate to VNet Integration (Backup-First Practice)
-
-With a verified backup in hand, the disruptive migration was performed. A new delegated subnet and private DNS zone were added in `network.tf`:
+With the backup confirmed safe I made the actual Terraform changes, adding a delegated subnet and a private DNS zone in network.tf, and removing the open firewall rule from postgresql.tf while setting public access to false.
 
 ```hcl
 resource "azurerm_subnet" "db" {
@@ -557,8 +461,6 @@ resource "azurerm_private_dns_zone_virtual_network_link" "postgres" {
 }
 ```
 
-In `postgresql.tf`, the open firewall rule was removed and the server was set to private, delegated access:
-
 ```hcl
   public_network_access_enabled = false
   delegated_subnet_id           = azurerm_subnet.db.id
@@ -566,7 +468,7 @@ In `postgresql.tf`, the open firewall rule was removed and the server was set to
   depends_on                    = [azurerm_private_dns_zone_virtual_network_link.postgres]
 ```
 
-`vm.tf`'s `depends_on` was updated to no longer reference the now-deleted firewall rule, preventing a "reference to undeclared resource" failure.
+I also had to update vm.tf so it no longer referenced the firewall rule I was deleting, otherwise apply would fail immediately.
 
 ```bash
 terraform plan
@@ -574,17 +476,11 @@ terraform plan
 
 ![Server will be replaced, public access disabled](./screenshots/44a-terraform-flexible_server.main-replaced-public_network_access_enabled-false.png)
 
-*Plan confirms the PostgreSQL server will be replaced (delegated_subnet_id forces recreation), with public_network_access_enabled flipping from true to false.*
-
 ![New DNS zone and VNet link will be created](./screenshots/44b-terraform-private_dns_zone-virtual_network_link-will-be-created.png)
-
-*The new private DNS zone and its VNet link are queued for creation, enabling internal-only name resolution for the database.*
 
 ![Old firewall rule will be destroyed](./screenshots/44c-terraform-firewall_rule.allow_all-will-be-destroyed.png)
 
-*The original "allow all IPs" firewall rule is destroyed, since it becomes irrelevant once public access is disabled entirely.*
-
-Critically, the plan showed the VM itself receiving only an in-place tag update, not a replacement - confirming the migration would not disturb the already-configured Docker/NPMplus/CrowdSec/oauth2-proxy stack on the VM.
+The plan showed the database itself getting destroyed and recreated, which makes sense since networking mode is set at creation time and cannot just be changed on a live server. Importantly the VM only showed an in place tag update, not a replacement, so the whole Docker, NPMplus, CrowdSec, oauth2-proxy setup from the earlier days was not going to be touched.
 
 ```bash
 terraform apply
@@ -592,11 +488,7 @@ terraform apply
 
 ![Migration applied successfully](./screenshots/45-terraform-apply-migration-done.png)
 
-*Apply completes: the database is destroyed and recreated inside the private subnet, public access is closed, and the VM remains untouched throughout.*
-
-#### Step 4: Restore and Verify Isolation
-
-With the database now unreachable from outside the VNet, the backup was copied to the VM and restored from there, over the identity-verified SSH channel from Day 1:
+Once the database was private, I had to restore from the VM instead of my laptop, since that is the only thing sitting inside the VNet now.
 
 ```bash
 scp -F azssh_config learningsteps_backup.sql <vm-ip>:/tmp/
@@ -604,17 +496,15 @@ scp -F azssh_config learningsteps_backup.sql <vm-ip>:/tmp/
 
 ![Backup copied to the VM](./screenshots/46a-backup-copied.png)
 
-*Backup file transferred to the VM, the only place with network access to the now-private database.*
-
 ```bash
 psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_journal sslmode=require" -f /tmp/learningsteps_backup.sql
 ```
 
 ![Restore executed](./screenshots/46b-restore-executed.png)
 
-*Restore completes; COPY 2 confirms both seeded journal entries were successfully restored. The numerous "no privileges were granted" warnings are expected and harmless - they relate to internal PostgreSQL system-catalog grants that Azure's managed service does not permit re-granting, and do not affect application data.*
+The restore printed a lot of warnings about privileges not being granted, but those are just about internal PostgreSQL system objects that Azure's managed service does not let you re-grant, they do not affect the actual application data. The important line was COPY 2, confirming both seeded journal entries came back.
 
-Isolation was then verified by repeating Step 1's exact connection attempt from outside the VNet:
+To check the isolation actually worked, I ran the exact same connection attempt from before, from outside the VNet.
 
 ```bash
 psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_journal sslmode=require"
@@ -622,11 +512,9 @@ psql "host=psql-lee.postgres.database.azure.com user=psqladmin dbname=learning_j
 
 ![External connection now fails to resolve](./screenshots/47-isolation-verified-external-fails.png)
 
-*The hostname no longer resolves at all from outside the VNet ("could not translate host name") - a stronger and cleaner result than a mere connection refusal, since the private DNS zone serving this name simply does not exist outside the virtual network.*
+This time the hostname did not even resolve, which is a stronger result than just getting refused, since the private DNS zone serving that name simply does not exist outside the virtual network at all.
 
-#### Step 5: Confirm the App Recovered
-
-Finally, the application itself - not just the database - was confirmed working, by requesting the live endpoint in a browser:
+Last check was making sure the app itself actually still worked, not just that the database existed somewhere.
 
 ```
 https://lee.westeurope.cloudapp.azure.com/entries
@@ -634,53 +522,12 @@ https://lee.westeurope.cloudapp.azure.com/entries
 
 ![App recovered with restored data](./screenshots/48-app-recovered-entries-restored.png)
 
-*The application successfully serves both original seeded journal entries after the migration - confirming full recovery with zero data loss, and that the VM's connection string (built from the static server name rather than a live database attribute) survived the underlying server being replaced.*
+Both journal entries came back exactly as before. The app's connection string was built from the fixed server name rather than a live attribute tied to the old database, which is why it kept working without me needing to change anything on the app side after the database got replaced underneath it.
 
+## 4. Explanation
 
----
-# **4. Analysis & Submission Questions**
+Looking back at the whole week, each part closed a different gap and mostly built on the one before it. Locking down SSH first meant that everything I did afterward, tunneling in to check the app, running commands on the VM, restoring the database, all happened over a channel that was already identity verified rather than a shared key. Adding TLS and the WAF gave the app a public entry point that was actually safe to expose, and having HTTPS working was what let the identity gate later on even function, since Entra ID will not accept a plain HTTP reply URL. Putting the identity gate in front of the API meant that by the time I moved the database, an attacker would have already had to get past two separate layers just to reach the point where the database mattered at all.
 
-**Why is RBAC required in addition to a managed identity and the AADSSHLoginForLinux extension?**
-Azure separates the management plane (control over cloud resources, e.g. Owner/Contributor) from the data plane (logging into the operating system itself). Even full subscription ownership does not grant OS-level login rights; the Virtual Machine Administrator Login role must be explicitly assigned, scoped to the specific VM resource, to close this gap deliberately rather than by default.
+None of these layers do the same job as each other. SSH lockdown protects the machine's management access, TLS protects the traffic in transit, the WAF looks at what a request contains, the identity gate checks who is sending it, and the database isolation limits which resources can even reach the database over the network. Removing any one of them leaves a different kind of gap that the others do not cover, which is really the whole point of doing this in layers instead of picking just one control and calling it done.
 
-**Why must the NSG rule specify /32 rather than the bare IP address?**
-`/32` in CIDR notation means "exactly one address, no range" - this is what restricts the rule to a single trusted host rather than an entire subnet.
-
-**Why did the plain HTTP request return 301 instead of the JSON response after Step 4?**
-Enabling Force HTTPS configures the reverse proxy to issue an HTTP redirect (301 Moved Permanently) for any request arriving unencrypted, rather than serving the response directly - ensuring no client can be served content over an unencrypted channel even by mistake.
-
-**Why did one attack payload bypass the WAF while an equivalent one did not?**
-The WAF's signature-matching rules for the SQL injection attack category did not recognize `+` as an equivalent encoding of a space, even though the backend application decodes `+` and `%20` identically. This is a real, known class of WAF-bypass technique (encoding-based evasion) and demonstrates that pattern/signature-based defenses provide probabilistic, not absolute, protection.
-
-**Does the WAF bypass mean the application itself is vulnerable to SQL injection?**
-Not necessarily, and this is an important distinction: the WAF is one layer of defense, separate from whether the application's own code uses parameterized queries (safe) or constructs raw SQL (exploitable). A WAF failing to block a payload does not, by itself, prove the underlying application is vulnerable - it only means that if the application were vulnerable, this specific bypass could reach it without being flagged in real time.
-
-**Why did `az ad app create` fail with "Insufficient privileges" even though the account holds a valid Entra ID role?**
-The error was misleading. The actual cause was a display-name collision with existing applications in a shared classroom tenant - Azure CLI attempted to patch an existing app with the same name rather than create a new one, and the account was not an owner of either existing app. Verifying with read-only ownership checks (`az ad app owner list`) before assuming a role/permissions problem was the key diagnostic step; a unique display name resolved it without any role change.
-
-**Why did the browser login fail with a 500 error even after Microsoft authentication succeeded?**
-oauth2-proxy requires an `email` claim by default to establish a user's session identity. This classroom Entra ID account's token did not populate a standard `email` claim, so oauth2-proxy had nothing to build a session from. Mapping identity to `preferred_username` (a claim reliably present for this account type) resolved it - a reminder that not every real-world identity provider or account type populates every "standard" claim a tool expects by default.
-
-**Why did enabling the Auth Request setting in NPMplus initially fail to save?**
-CrowdSec's WAF was blocking NPMplus's own admin API request (the SSH tunnel's traffic reaches NPMplus as `127.0.0.1`, previously banned by an earlier appsec decision from Day 2 testing) - the same interference pattern the Day 2 handbook explicitly warned could recur. This was not a configuration mistake in the Auth Request setting itself, but a security tool blocking its own management plane, diagnosed by reading the proxy's own logs rather than assuming the UI field was wrong.
-
-**Why did the same attack payload return a different status code before and after Day 3's changes?**
-Before Day 3, the WAF was the only layer inspecting the request, so a malicious payload was evaluated and blocked (`403`) regardless of who sent it. After Day 3, the Auth Request (identity) check runs *first* on the same location - an unauthenticated request is redirected to login (`302`) before it ever reaches the WAF, so the WAF never even evaluates it. This is not a security regression: an authenticated attacker's identical payload still reaches the WAF and is still blocked (`403`), proving both layers remain active - they simply inspect different, sequential slices of incoming traffic.
-
-**Why did adding `delegated_subnet_id` and `private_dns_zone_id` force the database to be destroyed and recreated, rather than updated in place?**
-These properties are only assignable at creation time for Azure Database for PostgreSQL Flexible Server - networking mode (public vs. VNet-delegated) is a foundational characteristic of the resource, not one Azure allows changing on a live server. This is why the exercise required a full backup-first approach rather than treating it as a simple toggle.
-
-**Why did the local Windows `psql` client fail to run at all, and why was switching to Azure Cloud Shell an acceptable substitute rather than a workaround that weakens the exercise?**
-Windows Smart App Control silently blocked the executable with no actionable unblock path short of a full OS reset. Cloud Shell is still a machine entirely outside the Azure VNet being built, so it demonstrates exactly the same property Demo 1 requires - public reachability from the open internet - without depending on a single local machine's security posture.
-
-**Why did the restore need to happen from the VM rather than directly from a laptop?**
-Once `public_network_access_enabled` was set to false, the database's DNS name only resolves inside the VNet via the newly created private DNS zone. The VM is the only resource in this environment that sits inside that VNet, making it the only place capable of reaching the database at all after the migration.
-
-**Why did the application recover successfully without any manual reconfiguration, despite the database being fully destroyed and recreated?**
-The VM's connection string was built from the statically-known server name (`psql-lee.postgres.database.azure.com`) rather than a live Terraform attribute tied to the old server's identity. Had it referenced the database's `.fqdn` output directly, that value would have become "known after apply," and since any change to `custom_data` forces VM replacement, the migration could have cascaded into destroying and recreating the entire VM - wiping the manually-installed Docker/NPMplus/CrowdSec/oauth2-proxy stack along with it. This was avoided by design.
-
-### Explanation
-
-Together, Day 1 and Day 2 demonstrate the principle of defense in depth applied to two different layers of the same system. Day 1 addressed the management plane: an identity-based, network-restricted SSH path replaced a globally reachable, key-based one, removing the most heavily automated class of internet attack (credential brute-forcing) as a viable path into the VM. Day 2 addressed the application's public-facing layer in three stages that build on one another - a public entry point was created, that entry point was encrypted end-to-end with a trusted certificate, and a Web Application Firewall was layered on top to inspect and block malicious request patterns before they reach the application code.
-
-The exercise also surfaced two findings beyond the prescribed steps that reinforce this principle in practice rather than theory. The WAF encoding bypass showed that a security control can be correctly enabled, correctly configured, and still have exploitable gaps in its own detection logic - meaning a defender should verify a control's actual behavior against varied inputs rather than trusting that "enabled" means "complete protection." The unsolicited scan from Contabo GmbH showed that this is not a hypothetical concern: real automated reconnaissance reached this environment within hours of it becoming reachable at all, independent of anything the operator did to attract attention. Both findings support the same underlying lesson of the exercise: every layer of defense reduces risk, but no single layer - and no single day's work - eliminates it entirely.
+The parts I found most useful were not the steps that went smoothly, they were the ones that broke in some way I had to actually figure out. The WAF letting through a `+` encoded SQL injection while blocking the `%20` version showed me that having a security tool switched on and configured correctly still does not guarantee it catches everything, since it only catches what its rules are actually written to recognize. Watching a real scanner from an unrelated IP show up in the logs within hours of the app going public made the idea that the internet is scanning you constantly feel real instead of theoretical. And the misleading insufficient privileges error partway through was a good reminder to actually check what is happening with read only commands before assuming the first explanation is the right one, since the real cause turned out to be a naming collision and had nothing to do with permissions at all.
