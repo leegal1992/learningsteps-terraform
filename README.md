@@ -14,7 +14,7 @@ Note: This is the lab report. For app deployment instructions, see Base Deployme
 
 ## 1. Summary of Findings
 
-This week I worked on hardening the LearningSteps environment, a FastAPI app with a PostgreSQL database running on Azure, deployed with Terraform. When I started, almost nothing was protected. SSH was open to any IP, the app had no encryption or WAF, the API accepted requests from anyone with no login at all, and the database was reachable straight from the public internet with a wide open firewall rule.
+This project I worked on hardening the LearningSteps environment, a FastAPI app with a PostgreSQL database running on Azure, deployed with Terraform. When I started, almost nothing was protected. SSH was open to any IP, the app had no encryption or WAF, the API accepted requests from anyone with no login at all, and the database was reachable straight from the public internet with a wide open firewall rule.
 
 Over the four days I locked each of these down one at a time. First I replaced the open SSH access with identity based login through Entra ID and restricted the network rule to my own IP. Then I gave the app a real public entry point with TLS and a web application firewall. After that I put an identity gate in front of the API so requests need a valid Entra ID login before they reach the app at all. Finally I moved the database off the public internet completely, using a proper backup first migration instead of just flipping a setting.
 
